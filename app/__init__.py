@@ -128,12 +128,14 @@ def create_app(test_config: dict | None = None) -> Flask:
             for report in service.list_reports_for_month(month, limit=500)
             if report["candidate_version"] == batch["version"]
         ]
+        stats_ready = service.has_stored_stats(batch_id)
         return render_template(
             "batch.html",
             month=month,
             batch=batch,
             page=page,
             reports=reports,
+            stats_ready=stats_ready,
             active=service.get_active_batch(month),
         )
 
@@ -191,6 +193,14 @@ def create_app(test_config: dict | None = None) -> Flask:
             outcome = service.confirm_report(report_no)
         except ServiceError as error:
             _flash_error(error)
+            return redirect(url_for("report_detail", report_no=report_no))
+        except Exception as error:  # 统计准备/写入失败：现行批未受影响，可重试
+            app.logger.exception("确认 %s 失败", report_no)
+            flash(
+                f"确认生效未完成：{error}。当时的现行批仍在正常供数，"
+                "本报告若仍通过且基线未换版，可再次确认。",
+                "error",
+            )
             return redirect(url_for("report_detail", report_no=report_no))
         if outcome["ok"]:
             flash(outcome["message"], "success")

@@ -106,7 +106,8 @@
 {% if report.status == 'passed' %}
 <section class="card">
   <h2>确认生效</h2>
-  <p class="hint">确认后候选批 V{{ report.candidate_version }} 成为 {{ report.month }} 的现行批，供下游取数；候选与报告一同生效，任一步失败则保留原批。</p>
+  <p class="hint">点击后才按原口径准备候选批 V{{ report.candidate_version }} 成为基线所需的分箱统计（旧库已存的候选统计直接复用），随后批次切换与统计写入在同一事务内生效，下一轮核对可直接使用。</p>
+  <p class="hint">准备统计期间不阻塞下游取现行批、其他月份登记或同月其他候选先行确认。若提交时发现基线已换版，本报告将标记失效并提示重新核对；若统计准备或写入失败，当时的现行批继续供数，本报告仍为待确认，可在排除故障后再次确认。</p>
   <form method="post" action="{{ url_for('confirm', report_no=report.report_no) }}">
     <button type="submit">确认生效</button>
   </form>

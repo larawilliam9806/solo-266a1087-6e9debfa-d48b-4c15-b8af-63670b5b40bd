@@ -12,8 +12,16 @@
 {% if batch.status == 'pending' %}
 <section class="card">
   <h2>与现行基线核对</h2>
+  <p class="hint">核对只读候选明细与现行基线预存的键和统计，不写库、不阻塞其他登记。</p>
+  <p class="hint">
+    {% if stats_ready %}
+      该候选已存有自身的分箱统计（可能由旧版本在上传时预计算），点「确认生效」时将直接复用，并与新批一同生效。
+    {% else %}
+      上传候选时不再预先计算它自己的分箱统计；值班员在核对通过后点「确认生效」时，才按原口径准备该候选成为基线所需的统计（键已随上传预存）。退回或搁置的候选不会产生这份计算。
+    {% endif %}
+  </p>
   {% if active %}
-  <p class="hint">以现行基线 V{{ active.version }} 为基准。两版均使用基线四分位切点分箱；核对只读候选明细与基线预存的键和统计。</p>
+  <p class="hint">以现行基线 V{{ active.version }} 为基准。两版均使用基线四分位切点分箱。</p>
   <form method="post" action="{{ url_for('run_reconcile', month=month, batch_id=batch.id) }}" class="card inline">
     <label>键缺失比例上限
       <input type="number" name="max_key_missing_ratio" min="0" max="1" step="0.0001" value="0.01" required>

@@ -17,6 +17,7 @@
   {% if active %}
     <p class="hint">现行基线批：V{{ active.version }}（{{ active.row_count }} 行 /
       {{ active.channel_count }} 渠道）。候选只能与现行批比对。</p>
+    <p class="hint">上传只做校验、保存明细与键，<strong>不计算候选自己的分箱统计</strong>；统计推迟到核对通过、值班员点「确认生效」时才准备，退回或搁置的候选无需这份开销。</p>
   {% else %}
     <p class="flash flash-error">该月份尚无已验收基线，请先登记首版。</p>
   {% endif %}

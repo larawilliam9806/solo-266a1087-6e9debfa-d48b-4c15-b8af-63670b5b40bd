@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import stats
-from .csv_loader import ParsedBatch, UploadError
+from .csv_loader import ParsedBatch, ParsedRow, UploadError
 from .db import get_db, transaction
 
 STATUS_ACTIVE = "active"
@@ -116,6 +116,106 @@ def _summarize_baseline(parsed: ParsedBatch) -> list[dict[str, Any]]:
     return summary
 
 
+_STATS_INSERT_SQL = (
+    "INSERT INTO batch_channel_stats (batch_id, channel, key_count,"
+    " amount_nonempty, amount_null_rate, amount_bins,"
+    " conversions_nonempty, conversions_null_rate, conversions_bins)"
+    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+
+def _channel_stats_records(
+    batch_id: int, summary: list[dict[str, Any]]
+) -> list[tuple]:
+    """把 _summarize_baseline 的结果转成 batch_channel_stats 写入记录。"""
+    return [
+        (
+            batch_id,
+            item["channel"],
+            item["key_count"],
+            item["amount_nonempty"],
+            item["amount_null_rate"],
+            json.dumps(item["amount_bins"], ensure_ascii=False),
+            item["conversions_nonempty"],
+            item["conversions_null_rate"],
+            json.dumps(item["conversions_bins"], ensure_ascii=False),
+        )
+        for item in summary
+    ]
+
+
+def _insert_channel_stats(
+    db: sqlite3.Connection, batch_id: int, summary: list[dict[str, Any]]
+) -> None:
+    db.executemany(_STATS_INSERT_SQL, _channel_stats_records(batch_id, summary))
+
+
+def has_stored_stats(batch_id: int) -> bool:
+    """该批次是否已预存渠道统计（旧库中的候选统计可直接复用）。"""
+    row = get_db().execute(
+        "SELECT 1 FROM batch_channel_stats WHERE batch_id = ? LIMIT 1",
+        (batch_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _load_batch_as_parsed(batch_id: int) -> ParsedBatch:
+    """从批次明细重建 ParsedBatch，供确认时按原口径计算自身统计。"""
+    rows = get_db().execute(
+        "SELECT channel, day, amount, conversions FROM batch_rows"
+        " WHERE batch_id = ? ORDER BY id",
+        (batch_id,),
+    ).fetchall()
+    parsed_rows = [
+        ParsedRow(row["channel"], row["day"], row["amount"], row["conversions"])
+        for row in rows
+    ]
+    return ParsedBatch(
+        month="",
+        rows=parsed_rows,
+        channels=sorted({row.channel for row in parsed_rows}),
+    )
+
+
+def build_batch_stats(batch_id: int) -> list[dict[str, Any]]:
+    """按原口径计算批次自身的渠道统计。
+
+    纯读 + CPU 计算，不开启/持有写事务：准备期间下游仍可取现行批，
+    其他月份可登记，同月其他候选也可先行确认。
+    """
+    parsed = _load_batch_as_parsed(batch_id)
+    return _summarize_baseline(parsed)
+
+
+def _prepare_candidate_stats(
+    candidate_id: int,
+) -> tuple[list[tuple] | None, bool]:
+    """prepare_candidate_stats 的实际实现（私有钩子，便于测试打桩）。"""
+    if has_stored_stats(candidate_id):
+        return None, True
+    summary = build_batch_stats(candidate_id)
+    return _channel_stats_records(candidate_id, summary), False
+
+
+def prepare_candidate_stats(
+    candidate_id: int,
+) -> tuple[list[tuple] | None, bool]:
+    """确认前准备候选成为基线后要用的统计。
+
+    返回 (待写入记录, 是否复用旧库已存统计)：
+    - 已有预存统计（含旧库上传时即算好的候选统计）→ 直接复用，记录为 None；
+    - 否则在事务外按原口径计算，返回待在生效事务内写入的记录。
+
+    本函数不开启写事务、不写库，以便确认流程把统计写入与批次切换放进
+    同一个生效事务。
+    """
+    return _prepare_candidate_stats(candidate_id)
+
+
+# 语义化别名。
+prepare_confirmation_stats = prepare_candidate_stats
+
+
 def register_baseline(month: str, filename: str, parsed: ParsedBatch) -> dict:
     validate_month(month)
     if parsed.month != month:
@@ -158,26 +258,7 @@ def register_baseline(month: str, filename: str, parsed: ParsedBatch) -> dict:
             "INSERT INTO batch_keys (batch_id, channel, day) VALUES (?, ?, ?)",
             [(batch_id, row.channel, row.day) for row in parsed.rows],
         )
-        db.executemany(
-            "INSERT INTO batch_channel_stats (batch_id, channel, key_count,"
-            " amount_nonempty, amount_null_rate, amount_bins,"
-            " conversions_nonempty, conversions_null_rate, conversions_bins)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-                (
-                    batch_id,
-                    item["channel"],
-                    item["key_count"],
-                    item["amount_nonempty"],
-                    item["amount_null_rate"],
-                    json.dumps(item["amount_bins"], ensure_ascii=False),
-                    item["conversions_nonempty"],
-                    item["conversions_null_rate"],
-                    json.dumps(item["conversions_bins"], ensure_ascii=False),
-                )
-                for item in summary
-            ],
-        )
+        _insert_channel_stats(db, batch_id, summary)
         return {"id": batch_id, "version": 1}
 
 
@@ -228,31 +309,11 @@ def register_candidate(month: str, filename: str, parsed: ParsedBatch) -> dict:
         )
         batch_id = int(cursor.lastrowid)
         _insert_rows(db, batch_id, parsed)
-        # 预存键与统计：本轮核对只用基线的预存数据，且该候选日后可成为基线。
+        # 键仍随上传预存（廉价且下轮核对要用）；候选自身的分箱统计改为值班员
+        # 点「确认生效」时才按原口径准备——退回或搁置的候选无需花费这份计算。
         db.executemany(
             "INSERT INTO batch_keys (batch_id, channel, day) VALUES (?, ?, ?)",
             [(batch_id, row.channel, row.day) for row in parsed.rows],
-        )
-        summary = _summarize_baseline(parsed)
-        db.executemany(
-            "INSERT INTO batch_channel_stats (batch_id, channel, key_count,"
-            " amount_nonempty, amount_null_rate, amount_bins,"
-            " conversions_nonempty, conversions_null_rate, conversions_bins)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-                (
-                    batch_id,
-                    item["channel"],
-                    item["key_count"],
-                    item["amount_nonempty"],
-                    item["amount_null_rate"],
-                    json.dumps(item["amount_bins"], ensure_ascii=False),
-                    item["conversions_nonempty"],
-                    item["conversions_null_rate"],
-                    json.dumps(item["conversions_bins"], ensure_ascii=False),
-                )
-                for item in summary
-            ],
         )
         return {"id": batch_id, "version": version, "baseline_version": active["version"]}
 
@@ -685,78 +746,149 @@ def list_reports_for_month(month: str, limit: int = 100) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def confirm_report(report_no: str) -> dict:
-    """候选批次与通过报告原子生效；失败则现行批保持不变。
+def _baseline_changed_message(current_version: int | None, baseline_version: int) -> str:
+    return (
+        "基线已换版（当前"
+        + (f" V{current_version}" if current_version is not None else "无现行批")
+        + "），本报告基线 V"
+        + str(baseline_version)
+        + " 已不是现行批，请重新核对后确认。"
+    )
 
-    返回 {"ok": bool, "message": str}；基线换版时 ok=False 且报告标记为失效。
-    """
+
+def _mark_report_stale_if_passed(report_id: int) -> None:
     with transaction() as db:
-        report = db.execute(
-            "SELECT * FROM reports WHERE report_no = ?", (report_no,)
-        ).fetchone()
-        if report is None:
-            raise ServiceError("报告不存在", 404)
-        if report["status"] == REPORT_CONFIRMED:
-            raise ServiceError("该报告已确认生效", 409)
-        if report["status"] == REPORT_STALE:
-            raise ServiceError("基线已换版，该报告已失效，请重新核对", 409)
-        if report["status"] != REPORT_PASSED:
-            raise ServiceError("核对未通过，不能确认", 409)
+        db.execute(
+            "UPDATE reports SET status = ? WHERE id = ? AND status = ?",
+            (REPORT_STALE, report_id, REPORT_PASSED),
+        )
 
-        month = report["month"]
-        active = db.execute(
+
+def confirm_report(report_no: str) -> dict:
+    """值班员确认：先在事务外准备候选自身统计，再原子生效。
+
+    阶段：
+    1. 无写锁读取报告/现行基线/候选，完成状态与基线版本校验；
+    2. 事务外按原口径准备统计（旧库已存则直接复用）——此期间不阻塞下游
+       取数、其他月份登记或同月另一候选先行确认；
+    3. BEGIN IMMEDIATE 生效事务内重新核对基线版本：若已换版则把报告置为
+       失效并返回 ok=False，提示重新核对；否则把统计写入与批次/报告状态
+       切换放在同一事务提交。准备或写入失败时现行批保持不变，报告仍是
+       passed，基线未变即可再次确认。
+    """
+    db = get_db()
+    report = db.execute(
+        "SELECT * FROM reports WHERE report_no = ?", (report_no,)
+    ).fetchone()
+    if report is None:
+        raise ServiceError("报告不存在", 404)
+    if report["status"] == REPORT_CONFIRMED:
+        raise ServiceError("该报告已确认生效", 409)
+    if report["status"] == REPORT_STALE:
+        raise ServiceError("基线已换版，该报告已失效，请重新核对", 409)
+    if report["status"] != REPORT_PASSED:
+        raise ServiceError("核对未通过，不能确认", 409)
+
+    month = report["month"]
+    baseline_id = int(report["baseline_batch_id"])
+    active = db.execute(
+        "SELECT * FROM batches WHERE month = ? AND status = ?",
+        (month, STATUS_ACTIVE),
+    ).fetchone()
+    if active is None or int(active["id"]) != baseline_id:
+        _mark_report_stale_if_passed(int(report["id"]))
+        current_version = int(active["version"]) if active is not None else None
+        return {
+            "ok": False,
+            "message": _baseline_changed_message(
+                current_version, int(report["baseline_version"])
+            ),
+        }
+
+    candidate_id = int(report["candidate_batch_id"])
+    candidate = db.execute(
+        "SELECT * FROM batches WHERE id = ?", (candidate_id,)
+    ).fetchone()
+    if candidate is None or candidate["status"] != STATUS_PENDING:
+        raise ServiceError("候选批次状态异常，无法确认", 409)
+
+    # 阶段 2：事务外准备统计。异常直接上抛——尚未做任何写操作，
+    # 报告仍为 passed，排除故障后可再次确认。
+    records, _reused_stored_stats = prepare_candidate_stats(candidate_id)
+
+    # 阶段 3：原子生效；报告状态与基线版本均以事务内重读为准。
+    with transaction() as tx:
+        latest = tx.execute(
+            "SELECT status FROM reports WHERE id = ?", (report["id"],)
+        ).fetchone()
+        if latest is None:
+            raise ServiceError("报告不存在", 404)
+        if latest["status"] == REPORT_CONFIRMED:
+            raise ServiceError("该报告已确认生效", 409)
+
+        current = tx.execute(
             "SELECT * FROM batches WHERE month = ? AND status = ?",
             (month, STATUS_ACTIVE),
         ).fetchone()
-        if active is None or int(active["id"]) != int(report["baseline_batch_id"]):
-            db.execute(
+        if current is None or int(current["id"]) != baseline_id:
+            tx.execute(
                 "UPDATE reports SET status = ? WHERE id = ? AND status = ?",
                 (REPORT_STALE, report["id"], REPORT_PASSED),
             )
-            current_version = active["version"] if active else None
+            current_version = int(current["version"]) if current is not None else None
             return {
                 "ok": False,
-                "message": (
-                    "基线已换版（当前"
-                    + (f" V{current_version}" if current_version else "无现行批")
-                    + "），本报告基线 V"
-                    + str(report["baseline_version"])
-                    + " 已不是现行批，请重新核对后确认。"
+                "message": _baseline_changed_message(
+                    current_version, int(report["baseline_version"])
                 ),
             }
 
-        candidate = db.execute(
-            "SELECT * FROM batches WHERE id = ?", (report["candidate_batch_id"],)
+        if latest["status"] == REPORT_STALE:
+            raise ServiceError("基线已换版，该报告已失效，请重新核对", 409)
+        if latest["status"] != REPORT_PASSED:
+            raise ServiceError("核对未通过，不能确认", 409)
+
+        candidate_row = tx.execute(
+            "SELECT status, version FROM batches WHERE id = ?", (candidate_id,)
         ).fetchone()
-        if candidate is None or candidate["status"] != STATUS_PENDING:
+        if candidate_row is None or candidate_row["status"] != STATUS_PENDING:
             raise ServiceError("候选批次状态异常，无法确认", 409)
 
+        # 统计与状态切换同一事务：要么一起生效，要么全部回滚。
+        if records is not None:
+            already = tx.execute(
+                "SELECT 1 FROM batch_channel_stats WHERE batch_id = ? LIMIT 1",
+                (candidate_id,),
+            ).fetchone()
+            if already is None:
+                tx.executemany(_STATS_INSERT_SQL, records)
+
         timestamp = now_iso()
-        db.execute(
+        tx.execute(
             "UPDATE batches SET status = ? WHERE id = ?",
-            (STATUS_SUPERSEDED, active["id"]),
+            (STATUS_SUPERSEDED, current["id"]),
         )
-        db.execute(
+        tx.execute(
             "UPDATE batches SET status = ?, activated_at = ?,"
             " activated_report_no = ? WHERE id = ?",
-            (STATUS_ACTIVE, timestamp, report_no, candidate["id"]),
+            (STATUS_ACTIVE, timestamp, report_no, candidate_id),
         )
-        db.execute(
+        tx.execute(
             "UPDATE reports SET status = ?, confirmed_at = ? WHERE id = ?",
             (REPORT_CONFIRMED, timestamp, report["id"]),
         )
-        db.execute(
+        tx.execute(
             "UPDATE reports SET status = ? WHERE month = ? AND status = ?"
             " AND id != ? AND baseline_batch_id = ?",
-            (REPORT_STALE, month, REPORT_PASSED, report["id"], active["id"]),
+            (REPORT_STALE, month, REPORT_PASSED, report["id"], baseline_id),
         )
         return {
             "ok": True,
             "message": (
-                f"{month} 现行批已切换为 V{candidate['version']}"
+                f"{month} 现行批已切换为 V{candidate_row['version']}"
                 f"（报告 {report_no}）"
             ),
-            "candidate_version": candidate["version"],
+            "candidate_version": candidate_row["version"],
         }
 
 
